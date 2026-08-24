@@ -6,8 +6,52 @@ import { calculateRetryDelay } from '../utils/retryCalculator.js';
 
 const WORKER_ID = `worker-${process.pid}`;
 const POLL_INTERVAL_MS = 1000;
+const HEARTBEAT_INTERVAL_MS = 5000;
+
+let workerRowId = null;   // our Worker table row's own UUID (different from WORKER_ID string)
+let isShuttingDown = false;
+let isJobInFlight = false;
+let pollTimer = null;
+let heartbeatTimer = null;
 
 console.log(`[${WORKER_ID}] Starting worker...`);
+
+/**
+ * Registers this process as a Worker row in the database and marks it ONLINE.
+ * Called once at startup.
+ */
+async function registerWorker() {
+  const worker = await prisma.worker.create({
+    data: {
+      name: WORKER_ID,
+      status: 'ONLINE',
+      lastHeartbeatAt: new Date(),
+    },
+  });
+  workerRowId = worker.id;
+  console.log(`[${WORKER_ID}] Registered as Worker row ${workerRowId}`);
+}
+
+/**
+ * Sends a heartbeat: updates the Worker row's lastHeartbeatAt (fast lookup)
+ * AND inserts a WorkerHeartbeat history row (full audit trail, per Phase 5 design).
+ */
+async function sendHeartbeat() {
+  if (!workerRowId) return;
+
+  const now = new Date();
+
+  await prisma.worker.update({
+    where: { id: workerRowId },
+    data: { status: 'ONLINE', lastHeartbeatAt: now },
+  });
+
+  await prisma.workerHeartbeat.create({
+    data: { workerId: workerRowId, status: 'ONLINE', createdAt: now },
+  });
+
+  console.log(`[${WORKER_ID}] Heartbeat sent.`);
+}
 
 async function findClaimableCandidate() {
   const now = new Date();
@@ -58,7 +102,6 @@ async function claimJob() {
     return null;
   }
 
-  // Atomic claim: must still match the SAME eligibility conditions used to find it
   const now = new Date();
   const result = await prisma.job.updateMany({
     where: {
@@ -84,13 +127,6 @@ async function claimJob() {
   return prisma.job.findUnique({ where: { id: candidate.id }, include: { queue: true } });
 }
 
-/**
- * Simulates job execution. Returns { success: true } or { success: false, error }.
- *
- * Real job execution logic would go here (calling an external API, sending an
- * email, etc). For this assignment, we simulate failure via a special payload
- * flag so we can reliably demonstrate and test the retry system.
- */
 async function executeJob(job) {
   await new Promise((resolve) => setTimeout(resolve, 1000));
 
@@ -101,10 +137,6 @@ async function executeJob(job) {
   return { success: true };
 }
 
-/**
- * Handles a failed job: decides whether to retry (with backoff) or
- * give up and hand off to the Dead Letter Queue.
- */
 async function handleFailure(job, errorMessage) {
   const maxAttempts = job.maxAttempts ?? job.queue.maxAttempts;
   const strategy = job.retryStrategy ?? job.queue.retryStrategy;
@@ -112,17 +144,11 @@ async function handleFailure(job, errorMessage) {
 
   const newAttemptCount = job.attemptCount + 1;
 
-    if (newAttemptCount >= maxAttempts) {
-    // Permanently failed — update job status AND create a DLQ record,
-    // atomically together, so the two never get out of sync.
+  if (newAttemptCount >= maxAttempts) {
     await prisma.$transaction([
       prisma.job.update({
         where: { id: job.id },
-        data: {
-          status: 'DEAD',
-          attemptCount: newAttemptCount,
-          lastError: errorMessage,
-        },
+        data: { status: 'DEAD', attemptCount: newAttemptCount, lastError: errorMessage },
       }),
       prisma.deadLetterQueue.create({
         data: {
@@ -149,12 +175,7 @@ async function handleFailure(job, errorMessage) {
 
   await prisma.job.update({
     where: { id: job.id },
-    data: {
-      status: 'SCHEDULED',
-      attemptCount: newAttemptCount,
-      nextRetryAt,
-      lastError: errorMessage,
-    },
+    data: { status: 'SCHEDULED', attemptCount: newAttemptCount, nextRetryAt, lastError: errorMessage },
   });
 
   await prisma.jobLog.create({
@@ -169,6 +190,8 @@ async function handleFailure(job, errorMessage) {
 }
 
 async function pollForJobs() {
+  if (isShuttingDown) return; // stop accepting new jobs once shutdown begins
+
   console.log(`[${WORKER_ID}] Polling for eligible jobs...`);
 
   const job = await claimJob();
@@ -178,6 +201,7 @@ async function pollForJobs() {
     return;
   }
 
+  isJobInFlight = true;
   console.log(`[${WORKER_ID}] CLAIMED job ${job.id}. Executing...`);
 
   await prisma.jobLog.create({
@@ -187,23 +211,65 @@ async function pollForJobs() {
   const result = await executeJob(job);
 
   if (result.success) {
-    await prisma.job.update({
-      where: { id: job.id },
-      data: { status: 'COMPLETED' },
-    });
-
+    await prisma.job.update({ where: { id: job.id }, data: { status: 'COMPLETED' } });
     await prisma.jobLog.create({
       data: { jobId: job.id, event: 'JOB_COMPLETED', message: `Completed by ${WORKER_ID}` },
     });
-
     console.log(`[${WORKER_ID}] COMPLETED job ${job.id}`);
   } else {
     await prisma.jobLog.create({
       data: { jobId: job.id, event: 'JOB_FAILED', message: `Failed: ${result.error}` },
     });
-
     await handleFailure(job, result.error);
   }
+
+  isJobInFlight = false;
 }
 
-setInterval(pollForJobs, POLL_INTERVAL_MS);
+/**
+ * Graceful shutdown handler.
+ * 1. Stop the timers (no new polling, no new heartbeats)
+ * 2. Wait for any in-flight job to finish (don't abandon it mid-execution)
+ * 3. Mark this Worker row OFFLINE in the database
+ * 4. Disconnect Prisma cleanly
+ * 5. Exit
+ */
+async function shutdown(signal) {
+  if (isShuttingDown) return; // avoid double-shutdown if signal fires twice
+  isShuttingDown = true;
+
+  console.log(`[${WORKER_ID}] Received ${signal}. Shutting down gracefully...`);
+
+  clearInterval(pollTimer);
+  clearInterval(heartbeatTimer);
+
+  if (isJobInFlight) {
+    console.log(`[${WORKER_ID}] Waiting for in-flight job to finish...`);
+    while (isJobInFlight) {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+  }
+
+  if (workerRowId) {
+    await prisma.worker.update({
+      where: { id: workerRowId },
+      data: { status: 'OFFLINE' },
+    });
+    console.log(`[${WORKER_ID}] Marked OFFLINE in database.`);
+  }
+
+  await prisma.$disconnect();
+  console.log(`[${WORKER_ID}] Shutdown complete. Exiting.`);
+  process.exit(0);
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+async function start() {
+  await registerWorker();
+  pollTimer = setInterval(pollForJobs, POLL_INTERVAL_MS);
+  heartbeatTimer = setInterval(sendHeartbeat, HEARTBEAT_INTERVAL_MS);
+}
+
+start();

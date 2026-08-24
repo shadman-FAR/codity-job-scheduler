@@ -8,6 +8,7 @@ import queueJobRoutes from './routes/queueJobRoutes.js';
 import jobRoutes from './routes/jobRoutes.js';
 import dlqRoutes from './routes/dlqRoutes.js';
 import { errorHandler } from './middleware/errorHandler.js';
+import workerRoutes from './routes/workerRoutes.js';
 
 const app = express();
 
@@ -29,7 +30,7 @@ app.use('/api/queues', queueRoutes);
 app.use('/api/queues/:queueId/jobs', queueJobRoutes);
 app.use('/api/jobs', jobRoutes);
 app.use('/api/dlq', dlqRoutes);
-
+app.use('/api/workers', workerRoutes);
 app.use(errorHandler);
 
 export default app;
