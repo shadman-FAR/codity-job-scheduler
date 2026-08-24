@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "dev": "node --watch src/server.js",
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "worker:dev": "node --watch src/worker/worker.js",
+    "worker:start": "node src/worker/worker.js"
   },
   "keywords": [],
   "author": "",
