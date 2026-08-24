@@ -4,6 +4,8 @@ import authRoutes from './routes/authRoutes.js';
 import projectRoutes from './routes/projectRoutes.js';
 import projectQueueRoutes from './routes/projectQueueRoutes.js';
 import queueRoutes from './routes/queueRoutes.js';
+import queueJobRoutes from './routes/queueJobRoutes.js';
+import jobRoutes from './routes/jobRoutes.js';
 import { errorHandler } from './middleware/errorHandler.js';
 
 const app = express();
@@ -23,6 +25,8 @@ app.use('/api/auth', authRoutes);
 app.use('/api/projects', projectRoutes);
 app.use('/api/projects/:projectId/queues', projectQueueRoutes);
 app.use('/api/queues', queueRoutes);
+app.use('/api/queues/:queueId/jobs', queueJobRoutes);
+app.use('/api/jobs', jobRoutes);
 
 app.use(errorHandler);
 
