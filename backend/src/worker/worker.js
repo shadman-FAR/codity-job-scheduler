@@ -2,29 +2,16 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import prisma from '../utils/prismaClient.js';
+import { calculateRetryDelay } from '../utils/retryCalculator.js';
 
 const WORKER_ID = `worker-${process.pid}`;
 const POLL_INTERVAL_MS = 1000;
 
 console.log(`[${WORKER_ID}] Starting worker...`);
 
-/**
- * Finds a candidate job to claim, respecting each queue's concurrency limit.
- *
- * Strategy:
- * 1. Get all active queues along with their concurrencyLimit and current
- *    count of RUNNING jobs.
- * 2. Filter to queues that still have room (runningCount < concurrencyLimit).
- * 3. Look for a QUEUED job only within those queues.
- *
- * This "check queues with room, then look for jobs there" approach still
- * has the same atomicity requirement as before: the actual claim (Phase 11's
- * conditional updateMany) is what finally enforces correctness. The queue
- * filtering here just makes our SELECT smarter about WHICH job to attempt --
- * the atomic updateMany afterward is still what prevents any double-claim
- * or limit violation from actually landing in the database.
- */
 async function findClaimableCandidate() {
+  const now = new Date();
+
   const queues = await prisma.queue.findMany({
     where: { isActive: true },
     select: {
@@ -42,29 +29,21 @@ async function findClaimableCandidate() {
 
   return prisma.job.findFirst({
     where: {
-      status: 'QUEUED',
       queueId: { in: queuesWithRoom },
+      OR: [
+        { status: 'QUEUED' },
+        { status: 'SCHEDULED', scheduledFor: { lte: now } },
+        { status: 'SCHEDULED', nextRetryAt: { lte: now } },
+      ],
     },
     orderBy: [{ priority: 'desc' }, { createdAt: 'asc' }],
+    include: { queue: true },
   });
 }
 
-/**
- * Atomically claims ONE eligible job, re-verifying BOTH:
- * - the job is still QUEUED (Phase 11's fix)
- * - the job's queue still has room under its concurrency limit (this phase's fix)
- *
- * Re-checking the concurrency limit again at claim time (not just during
- * candidate selection) closes the same kind of race window we closed in
- * Phase 11 -- two workers could both pass the "queue has room" check above
- * before either actually claims, so the limit must be enforced again here,
- * atomically, at the moment of the write.
- */
 async function claimJob() {
   const candidate = await findClaimableCandidate();
   if (!candidate) return null;
-
-  await new Promise((resolve) => setTimeout(resolve, 300));
 
   const queue = await prisma.queue.findUnique({
     where: { id: candidate.queueId },
@@ -79,10 +58,16 @@ async function claimJob() {
     return null;
   }
 
+  // Atomic claim: must still match the SAME eligibility conditions used to find it
+  const now = new Date();
   const result = await prisma.job.updateMany({
     where: {
       id: candidate.id,
-      status: 'QUEUED',
+      OR: [
+        { status: 'QUEUED' },
+        { status: 'SCHEDULED', scheduledFor: { lte: now } },
+        { status: 'SCHEDULED', nextRetryAt: { lte: now } },
+      ],
     },
     data: {
       status: 'RUNNING',
@@ -96,7 +81,78 @@ async function claimJob() {
     return null;
   }
 
-  return prisma.job.findUnique({ where: { id: candidate.id } });
+  return prisma.job.findUnique({ where: { id: candidate.id }, include: { queue: true } });
+}
+
+/**
+ * Simulates job execution. Returns { success: true } or { success: false, error }.
+ *
+ * Real job execution logic would go here (calling an external API, sending an
+ * email, etc). For this assignment, we simulate failure via a special payload
+ * flag so we can reliably demonstrate and test the retry system.
+ */
+async function executeJob(job) {
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+
+  if (job.payload?.shouldFail) {
+    return { success: false, error: 'Simulated failure (payload.shouldFail = true)' };
+  }
+
+  return { success: true };
+}
+
+/**
+ * Handles a failed job: decides whether to retry (with backoff) or
+ * give up and hand off to the Dead Letter Queue.
+ */
+async function handleFailure(job, errorMessage) {
+  const maxAttempts = job.maxAttempts ?? job.queue.maxAttempts;
+  const strategy = job.retryStrategy ?? job.queue.retryStrategy;
+  const baseDelay = job.baseDelaySeconds ?? job.queue.baseDelaySeconds;
+
+  const newAttemptCount = job.attemptCount + 1;
+
+  if (newAttemptCount >= maxAttempts) {
+    // Permanently failed — hand off to DLQ (built out fully in Phase 14)
+    await prisma.job.update({
+      where: { id: job.id },
+      data: {
+        status: 'DEAD',
+        attemptCount: newAttemptCount,
+        lastError: errorMessage,
+      },
+    });
+
+    await prisma.jobLog.create({
+      data: { jobId: job.id, event: 'JOB_MOVED_TO_DLQ', message: `Exhausted ${newAttemptCount} attempts: ${errorMessage}` },
+    });
+
+    console.log(`[${WORKER_ID}] Job ${job.id} exhausted retries (${newAttemptCount}/${maxAttempts}) — DEAD.`);
+    return;
+  }
+
+  const delaySeconds = calculateRetryDelay(strategy, baseDelay, newAttemptCount);
+  const nextRetryAt = new Date(Date.now() + delaySeconds * 1000);
+
+  await prisma.job.update({
+    where: { id: job.id },
+    data: {
+      status: 'SCHEDULED',
+      attemptCount: newAttemptCount,
+      nextRetryAt,
+      lastError: errorMessage,
+    },
+  });
+
+  await prisma.jobLog.create({
+    data: {
+      jobId: job.id,
+      event: 'JOB_RETRYING',
+      message: `Attempt ${newAttemptCount}/${maxAttempts} failed. Retrying in ${delaySeconds}s (${strategy}). Error: ${errorMessage}`,
+    },
+  });
+
+  console.log(`[${WORKER_ID}] Job ${job.id} failed (attempt ${newAttemptCount}/${maxAttempts}). Retry in ${delaySeconds}s via ${strategy}.`);
 }
 
 async function pollForJobs() {
@@ -115,18 +171,26 @@ async function pollForJobs() {
     data: { jobId: job.id, event: 'JOB_CLAIMED', message: `Claimed by ${WORKER_ID}` },
   });
 
-  await new Promise((resolve) => setTimeout(resolve, 3000)); // longer execution to make concurrency visible
+  const result = await executeJob(job);
 
-  await prisma.job.update({
-    where: { id: job.id },
-    data: { status: 'COMPLETED' },
-  });
+  if (result.success) {
+    await prisma.job.update({
+      where: { id: job.id },
+      data: { status: 'COMPLETED' },
+    });
 
-  await prisma.jobLog.create({
-    data: { jobId: job.id, event: 'JOB_COMPLETED', message: `Completed by ${WORKER_ID}` },
-  });
+    await prisma.jobLog.create({
+      data: { jobId: job.id, event: 'JOB_COMPLETED', message: `Completed by ${WORKER_ID}` },
+    });
 
-  console.log(`[${WORKER_ID}] COMPLETED job ${job.id}`);
+    console.log(`[${WORKER_ID}] COMPLETED job ${job.id}`);
+  } else {
+    await prisma.jobLog.create({
+      data: { jobId: job.id, event: 'JOB_FAILED', message: `Failed: ${result.error}` },
+    });
+
+    await handleFailure(job, result.error);
+  }
 }
 
 setInterval(pollForJobs, POLL_INTERVAL_MS);
