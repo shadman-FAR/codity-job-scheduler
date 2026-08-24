@@ -112,22 +112,35 @@ async function handleFailure(job, errorMessage) {
 
   const newAttemptCount = job.attemptCount + 1;
 
-  if (newAttemptCount >= maxAttempts) {
-    // Permanently failed — hand off to DLQ (built out fully in Phase 14)
-    await prisma.job.update({
-      where: { id: job.id },
-      data: {
-        status: 'DEAD',
-        attemptCount: newAttemptCount,
-        lastError: errorMessage,
-      },
-    });
+    if (newAttemptCount >= maxAttempts) {
+    // Permanently failed — update job status AND create a DLQ record,
+    // atomically together, so the two never get out of sync.
+    await prisma.$transaction([
+      prisma.job.update({
+        where: { id: job.id },
+        data: {
+          status: 'DEAD',
+          attemptCount: newAttemptCount,
+          lastError: errorMessage,
+        },
+      }),
+      prisma.deadLetterQueue.create({
+        data: {
+          jobId: job.id,
+          originalQueue: job.queue.name,
+          failureReason: errorMessage,
+          attemptsMade: newAttemptCount,
+          lastError: errorMessage,
+          workerInfo: WORKER_ID,
+        },
+      }),
+    ]);
 
     await prisma.jobLog.create({
       data: { jobId: job.id, event: 'JOB_MOVED_TO_DLQ', message: `Exhausted ${newAttemptCount} attempts: ${errorMessage}` },
     });
 
-    console.log(`[${WORKER_ID}] Job ${job.id} exhausted retries (${newAttemptCount}/${maxAttempts}) — DEAD.`);
+    console.log(`[${WORKER_ID}] Job ${job.id} exhausted retries (${newAttemptCount}/${maxAttempts}) — moved to DLQ.`);
     return;
   }
 
