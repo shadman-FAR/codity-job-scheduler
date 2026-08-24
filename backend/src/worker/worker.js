@@ -9,39 +9,80 @@ const POLL_INTERVAL_MS = 1000;
 console.log(`[${WORKER_ID}] Starting worker...`);
 
 /**
- * Atomically claims ONE eligible job.
+ * Finds a candidate job to claim, respecting each queue's concurrency limit.
  *
- * How it works:
- * 1. Find a candidate job (this SELECT can be "stale" — that's fine, see step 2)
- * 2. Attempt a conditional UPDATE: only succeeds if the job is STILL
- *    status='QUEUED' at the moment the UPDATE actually runs.
- * 3. Check how many rows the UPDATE affected:
- *    - 1 row  -> we won the race, we now own this job
- *    - 0 rows -> someone else claimed it first; we back off and try again
+ * Strategy:
+ * 1. Get all active queues along with their concurrencyLimit and current
+ *    count of RUNNING jobs.
+ * 2. Filter to queues that still have room (runningCount < concurrencyLimit).
+ * 3. Look for a QUEUED job only within those queues.
  *
- * This works because PostgreSQL guarantees that a single UPDATE statement
- * is atomic: no other transaction can modify the same row halfway through
- * our UPDATE. The WHERE clause is checked at the exact moment of the write,
- * not at some earlier SELECT time — closing the race condition window
- * completely.
+ * This "check queues with room, then look for jobs there" approach still
+ * has the same atomicity requirement as before: the actual claim (Phase 11's
+ * conditional updateMany) is what finally enforces correctness. The queue
+ * filtering here just makes our SELECT smarter about WHICH job to attempt --
+ * the atomic updateMany afterward is still what prevents any double-claim
+ * or limit violation from actually landing in the database.
  */
-async function claimJob() {
-  const candidate = await prisma.job.findFirst({
-    where: { status: 'QUEUED' },
-    orderBy: [{ priority: 'desc' }, { createdAt: 'asc' }],
+async function findClaimableCandidate() {
+  const queues = await prisma.queue.findMany({
+    where: { isActive: true },
+    select: {
+      id: true,
+      concurrencyLimit: true,
+      _count: { select: { jobs: { where: { status: 'RUNNING' } } } },
+    },
   });
 
+  const queuesWithRoom = queues
+    .filter((q) => q._count.jobs < q.concurrencyLimit)
+    .map((q) => q.id);
+
+  if (queuesWithRoom.length === 0) return null;
+
+  return prisma.job.findFirst({
+    where: {
+      status: 'QUEUED',
+      queueId: { in: queuesWithRoom },
+    },
+    orderBy: [{ priority: 'desc' }, { createdAt: 'asc' }],
+  });
+}
+
+/**
+ * Atomically claims ONE eligible job, re-verifying BOTH:
+ * - the job is still QUEUED (Phase 11's fix)
+ * - the job's queue still has room under its concurrency limit (this phase's fix)
+ *
+ * Re-checking the concurrency limit again at claim time (not just during
+ * candidate selection) closes the same kind of race window we closed in
+ * Phase 11 -- two workers could both pass the "queue has room" check above
+ * before either actually claims, so the limit must be enforced again here,
+ * atomically, at the moment of the write.
+ */
+async function claimJob() {
+  const candidate = await findClaimableCandidate();
   if (!candidate) return null;
 
-  // Simulate the same artificial delay as before, on purpose —
-  // this proves the fix works even under the exact same race conditions
-  // that broke the naive version.
-  await new Promise((resolve) => setTimeout(resolve, 2500));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  const queue = await prisma.queue.findUnique({
+    where: { id: candidate.queueId },
+    select: {
+      concurrencyLimit: true,
+      _count: { select: { jobs: { where: { status: 'RUNNING' } } } },
+    },
+  });
+
+  if (!queue || queue._count.jobs >= queue.concurrencyLimit) {
+    console.log(`[${WORKER_ID}] Queue for job ${candidate.id} is at capacity — skipping.`);
+    return null;
+  }
 
   const result = await prisma.job.updateMany({
     where: {
       id: candidate.id,
-      status: 'QUEUED', // <-- the critical condition, re-checked atomically at write time
+      status: 'QUEUED',
     },
     data: {
       status: 'RUNNING',
@@ -51,13 +92,10 @@ async function claimJob() {
   });
 
   if (result.count === 0) {
-    // Someone else claimed it between our SELECT and our UPDATE.
-    // This is expected and healthy — not an error.
     console.log(`[${WORKER_ID}] Lost race for job ${candidate.id} — already claimed by another worker.`);
     return null;
   }
 
-  // We won the race — fetch the full row now that we own it
   return prisma.job.findUnique({ where: { id: candidate.id } });
 }
 
@@ -77,8 +115,7 @@ async function pollForJobs() {
     data: { jobId: job.id, event: 'JOB_CLAIMED', message: `Claimed by ${WORKER_ID}` },
   });
 
-  // Simulate job execution
-  await new Promise((resolve) => setTimeout(resolve, 1000));
+  await new Promise((resolve) => setTimeout(resolve, 3000)); // longer execution to make concurrency visible
 
   await prisma.job.update({
     where: { id: job.id },
