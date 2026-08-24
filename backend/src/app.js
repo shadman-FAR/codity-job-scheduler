@@ -2,15 +2,15 @@ import express from 'express';
 import cors from 'cors';
 import authRoutes from './routes/authRoutes.js';
 import projectRoutes from './routes/projectRoutes.js';
+import projectQueueRoutes from './routes/projectQueueRoutes.js';
+import queueRoutes from './routes/queueRoutes.js';
 import { errorHandler } from './middleware/errorHandler.js';
 
 const app = express();
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// Health check route
 app.get('/api/health', (req, res) => {
   res.status(200).json({
     success: true,
@@ -19,11 +19,11 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Feature routes
 app.use('/api/auth', authRoutes);
 app.use('/api/projects', projectRoutes);
+app.use('/api/projects/:projectId/queues', projectQueueRoutes);
+app.use('/api/queues', queueRoutes);
 
-// Centralized error handler — must be last
 app.use(errorHandler);
 
 export default app;
