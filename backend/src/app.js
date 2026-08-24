@@ -9,6 +9,8 @@ import jobRoutes from './routes/jobRoutes.js';
 import dlqRoutes from './routes/dlqRoutes.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import workerRoutes from './routes/workerRoutes.js';
+import metricsRoutes from './routes/metricsRoutes.js';
+
 
 const app = express();
 
@@ -32,5 +34,6 @@ app.use('/api/jobs', jobRoutes);
 app.use('/api/dlq', dlqRoutes);
 app.use('/api/workers', workerRoutes);
 app.use(errorHandler);
+app.use('/api/metrics', metricsRoutes);
 
 export default app;
